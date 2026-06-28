@@ -1,36 +1,33 @@
-// _worker.js - 最终修复：处理相对路径 + 默认域名兜底
+// _worker.js - 带前端拦截脚本，解决 API 跨域问题
 export default {
   async fetch(request) {
     return handleRequest(request);
   }
 };
 
-// 默认目标域名（洛谷）
 const DEFAULT_ORIGIN = 'https://www.luogu.com.cn';
+const PROXY_DOMAIN = '你的代理域名'; // ⚠️ 请替换为你的实际代理域名（如 cloudflare-workers-proxy-doi.pages.dev）
 
 async function handleRequest(request) {
   try {
     const url = new URL(request.url);
 
-    // 根目录返回首页
     if (url.pathname === "/") {
       return finalizeResponse(new Response(getRootHtml(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       }));
     }
 
-    // ----- 解析目标 URL（兼容编码绝对路径和相对路径） -----
-    let rawPath = decodeURIComponent(url.pathname.substring(1)); // 去掉第一个 '/'
+    let rawPath = decodeURIComponent(url.pathname.substring(1));
     let actualUrlStr = rawPath;
 
-    // 尝试从 Referer 中提取基础 URL（仅当请求不是完整 URL）
     if (!actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
       let baseOrigin = null;
       const referer = request.headers.get('Referer');
       if (referer) {
         try {
           const refererUrl = new URL(referer);
-          const path = refererUrl.pathname; // 如 /https%3A%2F%2Fwww.luogu.com.cn%2F
+          const path = refererUrl.pathname;
           if (path.startsWith('/')) {
             const decoded = decodeURIComponent(path.substring(1));
             if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
@@ -39,18 +36,11 @@ async function handleRequest(request) {
           }
         } catch (e) {}
       }
-      // 如果 Referer 解析失败，使用默认域名
-      if (!baseOrigin) {
-        baseOrigin = DEFAULT_ORIGIN;
-      }
-      // 拼接相对路径
+      if (!baseOrigin) baseOrigin = DEFAULT_ORIGIN;
       actualUrlStr = baseOrigin + (actualUrlStr.startsWith('/') ? '' : '/') + actualUrlStr;
     }
-
-    // 附加查询参数
     if (url.search) actualUrlStr += url.search;
 
-    // ----- 构造转发请求，强制设置 Referer 和 Origin -----
     const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
     try {
       const targetOrigin = new URL(actualUrlStr).origin;
@@ -67,26 +57,20 @@ async function handleRequest(request) {
 
     const response = await fetch(modifiedRequest);
 
-    // 处理重定向
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       return finalizeResponse(handleRedirect(response));
     }
 
     const contentType = response.headers.get("Content-Type") || "";
-
-    // 处理 HTML
     if (contentType.includes("text/html")) {
       const htmlResponse = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
       return finalizeResponse(htmlResponse);
     }
-
-    // 处理 CSS
     if (contentType.includes("text/css")) {
       const cssResponse = await handleCssContent(response, actualUrlStr);
       return finalizeResponse(cssResponse);
     }
 
-    // 其他资源
     return finalizeResponse(response);
 
   } catch (error) {
@@ -131,46 +115,32 @@ function handleRedirect(response) {
   }
 }
 
-// ========== CSS 重写（url() 和 @import） ==========
+// ========== CSS 重写 ==========
 async function handleCssContent(response, cssUrl) {
-  const baseUrl = cssUrl; // 完整的 CSS 文件 URL
+  const baseUrl = cssUrl;
   const originalText = await response.text();
-
-  // 替换 url(...)
   let newText = originalText.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, path, q2) => {
     try {
-      if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('data:')) {
-        return match;
-      }
+      if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('data:')) return match;
       const absolute = new URL(path, baseUrl).href;
       const proxied = `/${encodeURIComponent(absolute)}`;
       return `url(${q1}${proxied}${q2})`;
     } catch (e) {
-      // 如果解析失败，尝试用默认域名拼接
       try {
         const absolute = new URL(path, DEFAULT_ORIGIN).href;
         const proxied = `/${encodeURIComponent(absolute)}`;
         return `url(${q1}${proxied}${q2})`;
-      } catch (_) {
-        return match;
-      }
+      } catch (_) { return match; }
     }
   });
-
-  // 处理 @import "path"
   newText = newText.replace(/@import\s+['"]([^'"]+)['"]/g, (match, path) => {
     try {
-      if (path.startsWith('http://') || path.startsWith('https://')) {
-        return match;
-      }
+      if (path.startsWith('http://') || path.startsWith('https://')) return match;
       const absolute = new URL(path, baseUrl).href;
       const proxied = `/${encodeURIComponent(absolute)}`;
       return `@import "${proxied}"`;
-    } catch (e) {
-      return match;
-    }
+    } catch (e) { return match; }
   });
-
   return new Response(newText, {
     status: response.status,
     statusText: response.statusText,
@@ -178,9 +148,61 @@ async function handleCssContent(response, cssUrl) {
   });
 }
 
-// ========== HTML 重写（删除 CSP meta + 替换资源链接） ==========
+// ========== HTML 重写（注入拦截脚本） ==========
 async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   const baseUrl = new URL(actualUrlStr).href;
+
+  // ---- 注入的拦截脚本 ----
+  const injectScript = `
+  <script>
+  (function() {
+    // 需要代理的域名列表（根据实际情况调整）
+    const targetDomains = ['luogu.com.cn', 'cdn.luogu.com.cn', 'fecdn.luogu.com.cn', 'www.luogu.com.cn'];
+    const proxyOrigin = window.location.origin; // 即你的代理域名
+
+    function proxyUrl(url) {
+      try {
+        const u = new URL(url);
+        if (targetDomains.some(d => u.hostname.endsWith(d))) {
+          // 将原站绝对 URL 转为代理路径
+          return proxyOrigin + '/' + encodeURIComponent(u.toString());
+        }
+        return url;
+      } catch (e) {
+        return url;
+      }
+    }
+
+    // 拦截 fetch
+    const originalFetch = window.fetch;
+    window.fetch = function(input, init) {
+      let url = typeof input === 'string' ? input : input.url;
+      if (url) {
+        const proxied = proxyUrl(url);
+        if (proxied !== url) {
+          return originalFetch(proxied, init);
+        }
+      }
+      return originalFetch(input, init);
+    };
+
+    // 拦截 XMLHttpRequest
+    const OriginalXHR = window.XMLHttpRequest;
+    window.XMLHttpRequest = function() {
+      const xhr = new OriginalXHR();
+      const originalOpen = xhr.open;
+      xhr.open = function(method, url, async, user, password) {
+        const proxied = proxyUrl(url);
+        if (proxied !== url) {
+          return originalOpen.call(this, method, proxied, async !== false, user, password);
+        }
+        return originalOpen.call(this, method, url, async !== false, user, password);
+      };
+      return xhr;
+    };
+  })();
+  </script>
+  `;
 
   const rewriter = new HTMLRewriter()
     .on('meta', {
@@ -189,6 +211,12 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         if (httpEquiv && httpEquiv.toLowerCase() === 'content-security-policy') {
           element.remove();
         }
+      }
+    })
+    // 在 <head> 末尾注入脚本
+    .on('head', {
+      element(element) {
+        element.append(injectScript, { html: true });
       }
     })
     .on('a', {
