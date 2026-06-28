@@ -1,16 +1,19 @@
-// _worker.js
+// _worker.js - 适用于 Cloudflare Pages 高级模式（_worker.js）
+// 功能：全能代理，自动重写 HTML/CSS 中的资源链接，支持协议相对 URL、相对路径、内联样式等
+// 使用 HTMLRewriter 流式解析，高效且准确
+
 export default {
   async fetch(request) {
     return handleRequest(request);
   }
 };
 
-// ========== 以下所有函数保持不变 ==========
+// ==================== 主请求处理器 ====================
 async function handleRequest(request) {
   try {
     const url = new URL(request.url);
 
-    // 如果访问根目录，返回HTML
+    // 根目录返回首页
     if (url.pathname === "/") {
       return new Response(getRootHtml(), {
         headers: {
@@ -19,19 +22,23 @@ async function handleRequest(request) {
       });
     }
 
-    // 从请求路径中提取目标 URL
+    // 提取目标 URL（去除开头的 /）
     let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
-
-    // 判断用户输入的 URL 是否带有协议
+    // 补全协议
     actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
-
-    // 保留查询参数
+    // 附加查询参数
     actualUrlStr += url.search;
 
-    // 创建新 Headers 对象，排除以 'cf-' 开头的请求头
+    // 构造转发请求的 Headers（过滤 cf- 开头）
     const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
+    // 修正 Referer 为目标站点的 Origin，避免防盗链
+    if (newHeaders.has('Referer')) {
+      try {
+        const targetOrigin = new URL(actualUrlStr).origin;
+        newHeaders.set('Referer', targetOrigin);
+      } catch (e) {}
+    }
 
-    // 创建一个新的请求以访问目标 URL
     const modifiedRequest = new Request(actualUrlStr, {
       headers: newHeaders,
       method: request.method,
@@ -39,90 +46,186 @@ async function handleRequest(request) {
       redirect: 'manual'
     });
 
-    // 发起对目标 URL 的请求
     const response = await fetch(modifiedRequest);
-    let body = response.body;
 
     // 处理重定向
     if ([301, 302, 303, 307, 308].includes(response.status)) {
-      body = response.body;
-      return handleRedirect(response, body);
-    } else if (response.headers.get("Content-Type")?.includes("text/html")) {
-      body = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
+      return handleRedirect(response);
     }
 
-    // 创建修改后的响应对象
-    const modifiedResponse = new Response(body, {
+    // 处理 HTML 内容（使用 HTMLRewriter 重写资源链接）
+    const contentType = response.headers.get("Content-Type") || "";
+    if (contentType.includes("text/html")) {
+      const htmlResponse = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
+      // 添加缓存和 CORS 头部
+      setNoCacheHeaders(htmlResponse.headers);
+      setCorsHeaders(htmlResponse.headers);
+      return htmlResponse;
+    }
+
+    // 非 HTML 内容：直接返回，但同样添加头部
+    const finalResponse = new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers
     });
+    setNoCacheHeaders(finalResponse.headers);
+    setCorsHeaders(finalResponse.headers);
+    return finalResponse;
 
-    // 添加禁用缓存的头部
-    setNoCacheHeaders(modifiedResponse.headers);
-
-    // 添加 CORS 头部，允许跨域访问
-    setCorsHeaders(modifiedResponse.headers);
-
-    return modifiedResponse;
   } catch (error) {
-    return jsonResponse({
-      error: error.message
-    }, 500);
+    return jsonResponse({ error: error.message }, 500);
   }
 }
 
+// ==================== 辅助函数 ====================
+
+// 补全协议
 function ensureProtocol(url, defaultProtocol) {
-  return url.startsWith("http://") || url.startsWith("https://") ? url : defaultProtocol + "//" + url;
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    return url;
+  }
+  return defaultProtocol + "//" + url;
 }
 
-function handleRedirect(response, body) {
-  const location = new URL(response.headers.get('location'));
-  const modifiedLocation = `/${encodeURIComponent(location.toString())}`;
-  return new Response(body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: {
-      ...response.headers,
-      'Location': modifiedLocation
-    }
-  });
+// 处理重定向（将 Location 转为代理路径）
+function handleRedirect(response) {
+  const location = response.headers.get('location');
+  if (!location) return response;
+  try {
+    const locationUrl = new URL(location);
+    const modifiedLocation = `/${encodeURIComponent(locationUrl.toString())}`;
+    const newHeaders = new Headers(response.headers);
+    newHeaders.set('Location', modifiedLocation);
+    return new Response(response.body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: newHeaders
+    });
+  } catch (e) {
+    return response;
+  }
 }
 
+// ==================== HTMLRewriter 处理器 ====================
 async function handleHtmlContent(response, protocol, host, actualUrlStr) {
-  const originalText = await response.text();
-  let modifiedText = replaceRelativePaths(originalText, protocol, host, new URL(actualUrlStr).origin);
-  return modifiedText;
+  const baseUrl = new URL(actualUrlStr).href; // 用于解析相对路径
+
+  const rewriter = new HTMLRewriter()
+    // 处理 <a href>
+    .on('a', {
+      element(element) {
+        const href = element.getAttribute('href');
+        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+          try {
+            const absolute = new URL(href, baseUrl).toString();
+            element.setAttribute('href', `/${encodeURIComponent(absolute)}`);
+          } catch (_) {}
+        }
+      }
+    })
+    // 处理 <img src>
+    .on('img', {
+      element(element) {
+        const src = element.getAttribute('src');
+        if (src) {
+          try {
+            const absolute = new URL(src, baseUrl).toString();
+            element.setAttribute('src', `/${encodeURIComponent(absolute)}`);
+          } catch (_) {}
+        }
+      }
+    })
+    // 处理 <script src>
+    .on('script', {
+      element(element) {
+        const src = element.getAttribute('src');
+        if (src) {
+          try {
+            const absolute = new URL(src, baseUrl).toString();
+            element.setAttribute('src', `/${encodeURIComponent(absolute)}`);
+          } catch (_) {}
+        }
+      }
+    })
+    // 处理 <link href> (CSS, favicon 等)
+    .on('link', {
+      element(element) {
+        const href = element.getAttribute('href');
+        if (href) {
+          try {
+            const absolute = new URL(href, baseUrl).toString();
+            element.setAttribute('href', `/${encodeURIComponent(absolute)}`);
+          } catch (_) {}
+        }
+      }
+    })
+    // 处理 <style> 标签内的 CSS url()
+    .on('style', {
+      text(text) {
+        const css = text.text;
+        const newCss = css.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, url, q2) => {
+          try {
+            const absolute = new URL(url, baseUrl).toString();
+            return `url(${q1}/${encodeURIComponent(absolute)}${q2})`;
+          } catch (_) {
+            return match;
+          }
+        });
+        text.replace(newCss);
+      }
+    })
+    // 处理元素内联 style="background: url(...)"
+    .on('*', {
+      element(element) {
+        const style = element.getAttribute('style');
+        if (style) {
+          const newStyle = style.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, url, q2) => {
+            try {
+              const absolute = new URL(url, baseUrl).toString();
+              return `url(${q1}/${encodeURIComponent(absolute)}${q2})`;
+            } catch (_) {
+              return match;
+            }
+          });
+          element.setAttribute('style', newStyle);
+        }
+      }
+    });
+
+  // 应用重写并返回新 Response
+  const modifiedResponse = rewriter.transform(response);
+  return modifiedResponse;
 }
 
-function replaceRelativePaths(text, protocol, host, origin) {
-  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
-  return text.replace(regex, `$1${protocol}//${host}/${origin}/`);
-}
+// ==================== 通用工具函数 ====================
 
+// JSON 响应
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data), {
     status: status,
-    headers: {
-      'Content-Type': 'application/json; charset=utf-8'
-    }
+    headers: { 'Content-Type': 'application/json; charset=utf-8' }
   });
 }
 
+// 过滤请求头
 function filterHeaders(headers, filterFunc) {
   return new Headers([...headers].filter(([name]) => filterFunc(name)));
 }
 
+// 禁用缓存
 function setNoCacheHeaders(headers) {
   headers.set('Cache-Control', 'no-store');
 }
 
+// CORS
 function setCorsHeaders(headers) {
   headers.set('Access-Control-Allow-Origin', '*');
-  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   headers.set('Access-Control-Allow-Headers', '*');
 }
 
+// ==================== 首页 HTML (保持不变) ====================
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
