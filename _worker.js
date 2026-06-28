@@ -1,4 +1,4 @@
-// _worker.js - 彻底移除 CSP，重写所有头部
+// _worker.js - 修复重定向丢失 Location 头问题
 export default {
   async fetch(request) {
     return handleRequest(request);
@@ -9,16 +9,19 @@ async function handleRequest(request) {
   try {
     const url = new URL(request.url);
 
+    // 根目录返回首页
     if (url.pathname === "/") {
       return finalizeResponse(new Response(getRootHtml(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       }));
     }
 
+    // 提取目标 URL
     let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
     actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
     actualUrlStr += url.search;
 
+    // 构造转发请求
     const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
     if (newHeaders.has('Referer')) {
       try {
@@ -36,17 +39,20 @@ async function handleRequest(request) {
 
     const response = await fetch(modifiedRequest);
 
+    // 处理重定向（修改 Location 为代理路径）
     if ([301, 302, 303, 307, 308].includes(response.status)) {
-      return finalizeResponse(handleRedirect(response));
+      const redirectedResponse = handleRedirect(response);
+      return finalizeResponse(redirectedResponse);
     }
 
+    // 处理 HTML 内容
     const contentType = response.headers.get("Content-Type") || "";
     if (contentType.includes("text/html")) {
       const htmlResponse = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
       return finalizeResponse(htmlResponse);
     }
 
-    // 非 HTML：也经过 finalizeResponse
+    // 其他内容（图片、CSS、JS 等）
     return finalizeResponse(response);
 
   } catch (error) {
@@ -54,19 +60,21 @@ async function handleRequest(request) {
   }
 }
 
-// ========== 核心修复：彻底重写响应头 ==========
+// ========== 核心修复：保留所有头，只删除危险头 ==========
 function finalizeResponse(response) {
-  // 仅保留 Content-Type
-  const contentType = response.headers.get('Content-Type') || 'application/octet-stream';
+  // 复制所有原始头
+  const newHeaders = new Headers(response.headers);
   
-  const newHeaders = new Headers({
-    'Content-Type': contentType,
-    'Cache-Control': 'no-store',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': '*'
-    // 不包含任何 CSP 相关头
-  });
+  // 删除可能造成限制的安全头
+  newHeaders.delete('Content-Security-Policy');
+  newHeaders.delete('X-Frame-Options');
+  newHeaders.delete('X-Content-Type-Options');
+  
+  // 添加 CORS 和缓存控制
+  newHeaders.set('Cache-Control', 'no-store');
+  newHeaders.set('Access-Control-Allow-Origin', '*');
+  newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  newHeaders.set('Access-Control-Allow-Headers', '*');
 
   return new Response(response.body, {
     status: response.status,
@@ -75,7 +83,8 @@ function finalizeResponse(response) {
   });
 }
 
-// ========== 以下函数保持不变 ==========
+// ========== 辅助函数 ==========
+
 function ensureProtocol(url, defaultProtocol) {
   if (url.startsWith("http://") || url.startsWith("https://")) {
     return url;
@@ -205,6 +214,7 @@ function filterHeaders(headers, filterFunc) {
   return new Headers([...headers].filter(([name]) => filterFunc(name)));
 }
 
+// ========== 首页 HTML（保持不变） ==========
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
