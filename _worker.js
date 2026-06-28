@@ -1,4 +1,4 @@
-// _worker.js - 最终版：删除响应头 CSP 和 HTML meta CSP
+// _worker.js - 最终稳定版：重写 CSS、修正 Referer、处理相对路径
 export default {
   async fetch(request) {
     return handleRequest(request);
@@ -9,23 +9,51 @@ async function handleRequest(request) {
   try {
     const url = new URL(request.url);
 
+    // 根目录返回首页
     if (url.pathname === "/") {
       return finalizeResponse(new Response(getRootHtml(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       }));
     }
 
+    // ----- 1. 解析目标 URL（支持编码绝对路径和相对路径） -----
     let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
-    actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
+
+    // 如果不是完整 URL，尝试从 Referer 中获取基础域名
+    if (!actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
+      const referer = request.headers.get('Referer');
+      if (referer) {
+        try {
+          // 从 Referer 中提取原始页面 URL（格式：https://代理域名/编码后的URL）
+          const refererUrl = new URL(referer);
+          const path = refererUrl.pathname; // 如 /https%3A%2F%2Fwww.luogu.com.cn%2F
+          if (path.startsWith('/')) {
+            const decoded = decodeURIComponent(path.substring(1));
+            if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
+              const baseOrigin = new URL(decoded).origin;
+              // 拼接相对路径
+              actualUrlStr = baseOrigin + (actualUrlStr.startsWith('/') ? '' : '/') + actualUrlStr;
+            }
+          }
+        } catch (e) {}
+      }
+    }
+
+    // 如果仍然不是完整 URL，报错
+    if (!actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
+      return jsonResponse({ error: 'Cannot resolve relative URL' }, 400);
+    }
+
+    // 附加查询参数
     actualUrlStr += url.search;
 
+    // ----- 2. 构造转发请求，强制设置 Referer -----
     const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
-    if (newHeaders.has('Referer')) {
-      try {
-        const targetOrigin = new URL(actualUrlStr).origin;
-        newHeaders.set('Referer', targetOrigin);
-      } catch (e) {}
-    }
+    // 强制设置 Referer 为目标站点的 origin
+    try {
+      const targetOrigin = new URL(actualUrlStr).origin;
+      newHeaders.set('Referer', targetOrigin);
+    } catch (e) {}
 
     const modifiedRequest = new Request(actualUrlStr, {
       headers: newHeaders,
@@ -36,16 +64,25 @@ async function handleRequest(request) {
 
     const response = await fetch(modifiedRequest);
 
+    // ----- 3. 处理重定向 -----
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       return finalizeResponse(handleRedirect(response));
     }
 
+    // ----- 4. 处理 HTML -----
     const contentType = response.headers.get("Content-Type") || "";
     if (contentType.includes("text/html")) {
       const htmlResponse = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
       return finalizeResponse(htmlResponse);
     }
 
+    // ----- 5. 处理 CSS（外部样式表） -----
+    if (contentType.includes("text/css")) {
+      const cssResponse = await handleCssContent(response, actualUrlStr);
+      return finalizeResponse(cssResponse);
+    }
+
+    // ----- 6. 其他资源（图片、JS、字体等）直接返回 -----
     return finalizeResponse(response);
 
   } catch (error) {
@@ -53,16 +90,14 @@ async function handleRequest(request) {
   }
 }
 
-// ========== 响应头处理：保留所有头，只删除危险头 ==========
+// ========== 响应头处理 ==========
 function finalizeResponse(response) {
   const newHeaders = new Headers(response.headers);
-  
+  // 删除可能限制资源的头
   newHeaders.delete('Content-Security-Policy');
   newHeaders.delete('X-Frame-Options');
   newHeaders.delete('X-Content-Type-Options');
-  // 也可能有其他类似头，可酌情删除
-  // newHeaders.delete('Referrer-Policy');
-  
+  // 添加 CORS 和缓存控制
   newHeaders.set('Cache-Control', 'no-store');
   newHeaders.set('Access-Control-Allow-Origin', '*');
   newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -75,14 +110,7 @@ function finalizeResponse(response) {
   });
 }
 
-// ========== 辅助函数 ==========
-function ensureProtocol(url, defaultProtocol) {
-  if (url.startsWith("http://") || url.startsWith("https://")) {
-    return url;
-  }
-  return defaultProtocol + "//" + url;
-}
-
+// ========== 处理重定向 ==========
 function handleRedirect(response) {
   const location = response.headers.get('location');
   if (!location) return response;
@@ -101,12 +129,41 @@ function handleRedirect(response) {
   }
 }
 
-// ========== HTMLRewriter 处理器（含 meta CSP 删除） ==========
+// ========== 重写 CSS 内容（核心新增） ==========
+async function handleCssContent(response, cssUrl) {
+  const baseUrl = cssUrl; // 完整的 CSS 文件 URL
+  const originalText = await response.text();
+
+  // 替换 url(...) 中的相对路径为绝对路径，再编码成代理路径
+  const newText = originalText.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, urlPath, q2) => {
+    try {
+      // 如果已经是绝对 URL 或 data:，保留不变
+      if (urlPath.startsWith('http://') || urlPath.startsWith('https://') || urlPath.startsWith('data:')) {
+        return match;
+      }
+      // 解析为绝对 URL（基于 CSS 文件的位置）
+      const absolute = new URL(urlPath, baseUrl).href;
+      // 转换为代理路径：/ + encodeURIComponent(absolute)
+      const proxied = `/${encodeURIComponent(absolute)}`;
+      return `url(${q1}${proxied}${q2})`;
+    } catch (e) {
+      return match;
+    }
+  });
+
+  return new Response(newText, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  });
+}
+
+// ========== HTMLRewriter（处理 HTML，包括删除 CSP meta） ==========
 async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   const baseUrl = new URL(actualUrlStr).href;
 
   const rewriter = new HTMLRewriter()
-    // === 删除 CSP meta 标签 ===
+    // 删除 CSP meta
     .on('meta', {
       element(element) {
         const httpEquiv = element.getAttribute('http-equiv');
@@ -115,7 +172,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
-    // 处理链接
+    // 重写 a href
     .on('a', {
       element(element) {
         const href = element.getAttribute('href');
@@ -127,6 +184,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
+    // 重写 img src 和 srcset
     .on('img', {
       element(element) {
         const src = element.getAttribute('src');
@@ -149,6 +207,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
+    // 重写 script src
     .on('script', {
       element(element) {
         const src = element.getAttribute('src');
@@ -160,6 +219,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
+    // 重写 link href
     .on('link', {
       element(element) {
         const href = element.getAttribute('href');
@@ -171,12 +231,13 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
+    // 重写内联 style 标签中的 url()
     .on('style', {
       text(text) {
         const css = text.text;
-        const newCss = css.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, url, q2) => {
+        const newCss = css.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, urlPath, q2) => {
           try {
-            const absolute = new URL(url, baseUrl).toString();
+            const absolute = new URL(urlPath, baseUrl).toString();
             return `url(${q1}/${encodeURIComponent(absolute)}${q2})`;
           } catch (_) {
             return match;
@@ -185,13 +246,14 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         text.replace(newCss);
       }
     })
+    // 重写元素内联 style 属性中的 url()
     .on('*', {
       element(element) {
         const style = element.getAttribute('style');
         if (style) {
-          const newStyle = style.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, url, q2) => {
+          const newStyle = style.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, urlPath, q2) => {
             try {
-              const absolute = new URL(url, baseUrl).toString();
+              const absolute = new URL(urlPath, baseUrl).toString();
               return `url(${q1}/${encodeURIComponent(absolute)}${q2})`;
             } catch (_) {
               return match;
@@ -205,6 +267,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   return rewriter.transform(response);
 }
 
+// ========== 工具函数 ==========
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data), {
     status: status,
@@ -216,6 +279,7 @@ function filterHeaders(headers, filterFunc) {
   return new Headers([...headers].filter(([name]) => filterFunc(name)));
 }
 
+// ========== 首页 HTML ==========
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
