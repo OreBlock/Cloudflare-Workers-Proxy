@@ -1,9 +1,12 @@
-// _worker.js - 最终稳定版：重写 CSS、修正 Referer、处理相对路径
+// _worker.js - 最终修复：处理相对路径 + 默认域名兜底
 export default {
   async fetch(request) {
     return handleRequest(request);
   }
 };
+
+// 默认目标域名（洛谷）
+const DEFAULT_ORIGIN = 'https://www.luogu.com.cn';
 
 async function handleRequest(request) {
   try {
@@ -16,43 +19,43 @@ async function handleRequest(request) {
       }));
     }
 
-    // ----- 1. 解析目标 URL（支持编码绝对路径和相对路径） -----
-    let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
+    // ----- 解析目标 URL（兼容编码绝对路径和相对路径） -----
+    let rawPath = decodeURIComponent(url.pathname.substring(1)); // 去掉第一个 '/'
+    let actualUrlStr = rawPath;
 
-    // 如果不是完整 URL，尝试从 Referer 中获取基础域名
+    // 尝试从 Referer 中提取基础 URL（仅当请求不是完整 URL）
     if (!actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
+      let baseOrigin = null;
       const referer = request.headers.get('Referer');
       if (referer) {
         try {
-          // 从 Referer 中提取原始页面 URL（格式：https://代理域名/编码后的URL）
           const refererUrl = new URL(referer);
           const path = refererUrl.pathname; // 如 /https%3A%2F%2Fwww.luogu.com.cn%2F
           if (path.startsWith('/')) {
             const decoded = decodeURIComponent(path.substring(1));
             if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
-              const baseOrigin = new URL(decoded).origin;
-              // 拼接相对路径
-              actualUrlStr = baseOrigin + (actualUrlStr.startsWith('/') ? '' : '/') + actualUrlStr;
+              baseOrigin = new URL(decoded).origin;
             }
           }
         } catch (e) {}
       }
-    }
-
-    // 如果仍然不是完整 URL，报错
-    if (!actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
-      return jsonResponse({ error: 'Cannot resolve relative URL' }, 400);
+      // 如果 Referer 解析失败，使用默认域名
+      if (!baseOrigin) {
+        baseOrigin = DEFAULT_ORIGIN;
+      }
+      // 拼接相对路径
+      actualUrlStr = baseOrigin + (actualUrlStr.startsWith('/') ? '' : '/') + actualUrlStr;
     }
 
     // 附加查询参数
-    actualUrlStr += url.search;
+    if (url.search) actualUrlStr += url.search;
 
-    // ----- 2. 构造转发请求，强制设置 Referer -----
+    // ----- 构造转发请求，强制设置 Referer 和 Origin -----
     const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
-    // 强制设置 Referer 为目标站点的 origin
     try {
       const targetOrigin = new URL(actualUrlStr).origin;
       newHeaders.set('Referer', targetOrigin);
+      newHeaders.set('Origin', targetOrigin);
     } catch (e) {}
 
     const modifiedRequest = new Request(actualUrlStr, {
@@ -64,28 +67,30 @@ async function handleRequest(request) {
 
     const response = await fetch(modifiedRequest);
 
-    // ----- 3. 处理重定向 -----
+    // 处理重定向
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       return finalizeResponse(handleRedirect(response));
     }
 
-    // ----- 4. 处理 HTML -----
     const contentType = response.headers.get("Content-Type") || "";
+
+    // 处理 HTML
     if (contentType.includes("text/html")) {
       const htmlResponse = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
       return finalizeResponse(htmlResponse);
     }
 
-    // ----- 5. 处理 CSS（外部样式表） -----
+    // 处理 CSS
     if (contentType.includes("text/css")) {
       const cssResponse = await handleCssContent(response, actualUrlStr);
       return finalizeResponse(cssResponse);
     }
 
-    // ----- 6. 其他资源（图片、JS、字体等）直接返回 -----
+    // 其他资源
     return finalizeResponse(response);
 
   } catch (error) {
+    console.error(error);
     return jsonResponse({ error: error.message }, 500);
   }
 }
@@ -93,16 +98,13 @@ async function handleRequest(request) {
 // ========== 响应头处理 ==========
 function finalizeResponse(response) {
   const newHeaders = new Headers(response.headers);
-  // 删除可能限制资源的头
   newHeaders.delete('Content-Security-Policy');
   newHeaders.delete('X-Frame-Options');
   newHeaders.delete('X-Content-Type-Options');
-  // 添加 CORS 和缓存控制
   newHeaders.set('Cache-Control', 'no-store');
   newHeaders.set('Access-Control-Allow-Origin', '*');
   newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   newHeaders.set('Access-Control-Allow-Headers', '*');
-
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -110,7 +112,7 @@ function finalizeResponse(response) {
   });
 }
 
-// ========== 处理重定向 ==========
+// ========== 重定向 ==========
 function handleRedirect(response) {
   const location = response.headers.get('location');
   if (!location) return response;
@@ -129,23 +131,41 @@ function handleRedirect(response) {
   }
 }
 
-// ========== 重写 CSS 内容（核心新增） ==========
+// ========== CSS 重写（url() 和 @import） ==========
 async function handleCssContent(response, cssUrl) {
   const baseUrl = cssUrl; // 完整的 CSS 文件 URL
   const originalText = await response.text();
 
-  // 替换 url(...) 中的相对路径为绝对路径，再编码成代理路径
-  const newText = originalText.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, urlPath, q2) => {
+  // 替换 url(...)
+  let newText = originalText.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, path, q2) => {
     try {
-      // 如果已经是绝对 URL 或 data:，保留不变
-      if (urlPath.startsWith('http://') || urlPath.startsWith('https://') || urlPath.startsWith('data:')) {
+      if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('data:')) {
         return match;
       }
-      // 解析为绝对 URL（基于 CSS 文件的位置）
-      const absolute = new URL(urlPath, baseUrl).href;
-      // 转换为代理路径：/ + encodeURIComponent(absolute)
+      const absolute = new URL(path, baseUrl).href;
       const proxied = `/${encodeURIComponent(absolute)}`;
       return `url(${q1}${proxied}${q2})`;
+    } catch (e) {
+      // 如果解析失败，尝试用默认域名拼接
+      try {
+        const absolute = new URL(path, DEFAULT_ORIGIN).href;
+        const proxied = `/${encodeURIComponent(absolute)}`;
+        return `url(${q1}${proxied}${q2})`;
+      } catch (_) {
+        return match;
+      }
+    }
+  });
+
+  // 处理 @import "path"
+  newText = newText.replace(/@import\s+['"]([^'"]+)['"]/g, (match, path) => {
+    try {
+      if (path.startsWith('http://') || path.startsWith('https://')) {
+        return match;
+      }
+      const absolute = new URL(path, baseUrl).href;
+      const proxied = `/${encodeURIComponent(absolute)}`;
+      return `@import "${proxied}"`;
     } catch (e) {
       return match;
     }
@@ -158,12 +178,11 @@ async function handleCssContent(response, cssUrl) {
   });
 }
 
-// ========== HTMLRewriter（处理 HTML，包括删除 CSP meta） ==========
+// ========== HTML 重写（删除 CSP meta + 替换资源链接） ==========
 async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   const baseUrl = new URL(actualUrlStr).href;
 
   const rewriter = new HTMLRewriter()
-    // 删除 CSP meta
     .on('meta', {
       element(element) {
         const httpEquiv = element.getAttribute('http-equiv');
@@ -172,25 +191,23 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
-    // 重写 a href
     .on('a', {
       element(element) {
         const href = element.getAttribute('href');
         if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
           try {
-            const absolute = new URL(href, baseUrl).toString();
+            const absolute = new URL(href, baseUrl).href;
             element.setAttribute('href', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
       }
     })
-    // 重写 img src 和 srcset
     .on('img', {
       element(element) {
         const src = element.getAttribute('src');
         if (src) {
           try {
-            const absolute = new URL(src, baseUrl).toString();
+            const absolute = new URL(src, baseUrl).href;
             element.setAttribute('src', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
@@ -199,7 +216,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
           const newSrcset = srcset.split(',').map(part => {
             const [url, size] = part.trim().split(/\s+/);
             try {
-              const absolute = new URL(url, baseUrl).toString();
+              const absolute = new URL(url, baseUrl).href;
               return `/${encodeURIComponent(absolute)}${size ? ' ' + size : ''}`;
             } catch (_) { return part; }
           }).join(', ');
@@ -207,37 +224,34 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
-    // 重写 script src
     .on('script', {
       element(element) {
         const src = element.getAttribute('src');
         if (src) {
           try {
-            const absolute = new URL(src, baseUrl).toString();
+            const absolute = new URL(src, baseUrl).href;
             element.setAttribute('src', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
       }
     })
-    // 重写 link href
     .on('link', {
       element(element) {
         const href = element.getAttribute('href');
         if (href) {
           try {
-            const absolute = new URL(href, baseUrl).toString();
+            const absolute = new URL(href, baseUrl).href;
             element.setAttribute('href', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
       }
     })
-    // 重写内联 style 标签中的 url()
     .on('style', {
       text(text) {
         const css = text.text;
-        const newCss = css.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, urlPath, q2) => {
+        const newCss = css.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, path, q2) => {
           try {
-            const absolute = new URL(urlPath, baseUrl).toString();
+            const absolute = new URL(path, baseUrl).href;
             return `url(${q1}/${encodeURIComponent(absolute)}${q2})`;
           } catch (_) {
             return match;
@@ -246,14 +260,13 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         text.replace(newCss);
       }
     })
-    // 重写元素内联 style 属性中的 url()
     .on('*', {
       element(element) {
         const style = element.getAttribute('style');
         if (style) {
-          const newStyle = style.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, urlPath, q2) => {
+          const newStyle = style.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, path, q2) => {
             try {
-              const absolute = new URL(urlPath, baseUrl).toString();
+              const absolute = new URL(path, baseUrl).href;
               return `url(${q1}/${encodeURIComponent(absolute)}${q2})`;
             } catch (_) {
               return match;
@@ -267,7 +280,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   return rewriter.transform(response);
 }
 
-// ========== 工具函数 ==========
+// ========== 工具 ==========
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data), {
     status: status,
@@ -279,7 +292,6 @@ function filterHeaders(headers, filterFunc) {
   return new Headers([...headers].filter(([name]) => filterFunc(name)));
 }
 
-// ========== 首页 HTML ==========
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
