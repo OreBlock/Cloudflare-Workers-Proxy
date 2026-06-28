@@ -1,28 +1,24 @@
-// _worker.js - 修复 CSP 阻断问题
+// _worker.js - 彻底移除 CSP，重写所有头部
 export default {
   async fetch(request) {
     return handleRequest(request);
   }
 };
 
-// ==================== 主请求处理器 ====================
 async function handleRequest(request) {
   try {
     const url = new URL(request.url);
 
-    // 根目录返回首页
     if (url.pathname === "/") {
       return finalizeResponse(new Response(getRootHtml(), {
         headers: { 'Content-Type': 'text/html; charset=utf-8' }
       }));
     }
 
-    // 提取目标 URL
     let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
     actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
     actualUrlStr += url.search;
 
-    // 构造转发请求
     const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
     if (newHeaders.has('Referer')) {
       try {
@@ -40,48 +36,46 @@ async function handleRequest(request) {
 
     const response = await fetch(modifiedRequest);
 
-    // 处理重定向
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       return finalizeResponse(handleRedirect(response));
     }
 
-    // 处理 HTML 内容（使用 HTMLRewriter 重写资源链接）
     const contentType = response.headers.get("Content-Type") || "";
     if (contentType.includes("text/html")) {
       const htmlResponse = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
       return finalizeResponse(htmlResponse);
     }
 
-    // 非 HTML 内容
-    const finalResponse = new Response(response.body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: response.headers
-    });
-    return finalizeResponse(finalResponse);
+    // 非 HTML：也经过 finalizeResponse
+    return finalizeResponse(response);
 
   } catch (error) {
     return jsonResponse({ error: error.message }, 500);
   }
 }
 
-// ==================== 响应统一处理（移除 CSP 等）====================
+// ========== 核心修复：彻底重写响应头 ==========
 function finalizeResponse(response) {
-  const headers = response.headers;
-  // 移除可能导致资源加载失败的安全头
-  headers.delete('Content-Security-Policy');
-  headers.delete('X-Frame-Options');
-  headers.delete('X-Content-Type-Options');
-  // 添加缓存控制和 CORS
-  headers.set('Cache-Control', 'no-store');
-  headers.set('Access-Control-Allow-Origin', '*');
-  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  headers.set('Access-Control-Allow-Headers', '*');
-  return response;
+  // 仅保留 Content-Type
+  const contentType = response.headers.get('Content-Type') || 'application/octet-stream';
+  
+  const newHeaders = new Headers({
+    'Content-Type': contentType,
+    'Cache-Control': 'no-store',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': '*'
+    // 不包含任何 CSP 相关头
+  });
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: newHeaders
+  });
 }
 
-// ==================== 辅助函数 ====================
-
+// ========== 以下函数保持不变 ==========
 function ensureProtocol(url, defaultProtocol) {
   if (url.startsWith("http://") || url.startsWith("https://")) {
     return url;
@@ -107,7 +101,6 @@ function handleRedirect(response) {
   }
 }
 
-// ==================== HTMLRewriter 处理器 ====================
 async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   const baseUrl = new URL(actualUrlStr).href;
 
@@ -132,7 +125,6 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
             element.setAttribute('src', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
-        // 处理 srcset（响应式图片）
         const srcset = element.getAttribute('srcset');
         if (srcset) {
           const newSrcset = srcset.split(',').map(part => {
@@ -202,8 +194,6 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   return rewriter.transform(response);
 }
 
-// ==================== 通用工具 ====================
-
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data), {
     status: status,
@@ -215,7 +205,6 @@ function filterHeaders(headers, filterFunc) {
   return new Headers([...headers].filter(([name]) => filterFunc(name)));
 }
 
-// ==================== 首页 HTML（不变） ====================
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
