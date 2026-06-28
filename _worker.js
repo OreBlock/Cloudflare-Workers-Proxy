@@ -1,7 +1,4 @@
-// _worker.js - 适用于 Cloudflare Pages 高级模式（_worker.js）
-// 功能：全能代理，自动重写 HTML/CSS 中的资源链接，支持协议相对 URL、相对路径、内联样式等
-// 使用 HTMLRewriter 流式解析，高效且准确
-
+// _worker.js - 修复 CSP 阻断问题
 export default {
   async fetch(request) {
     return handleRequest(request);
@@ -15,23 +12,18 @@ async function handleRequest(request) {
 
     // 根目录返回首页
     if (url.pathname === "/") {
-      return new Response(getRootHtml(), {
-        headers: {
-          'Content-Type': 'text/html; charset=utf-8'
-        }
-      });
+      return finalizeResponse(new Response(getRootHtml(), {
+        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+      }));
     }
 
-    // 提取目标 URL（去除开头的 /）
+    // 提取目标 URL
     let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
-    // 补全协议
     actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
-    // 附加查询参数
     actualUrlStr += url.search;
 
-    // 构造转发请求的 Headers（过滤 cf- 开头）
+    // 构造转发请求
     const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
-    // 修正 Referer 为目标站点的 Origin，避免防盗链
     if (newHeaders.has('Referer')) {
       try {
         const targetOrigin = new URL(actualUrlStr).origin;
@@ -50,37 +42,46 @@ async function handleRequest(request) {
 
     // 处理重定向
     if ([301, 302, 303, 307, 308].includes(response.status)) {
-      return handleRedirect(response);
+      return finalizeResponse(handleRedirect(response));
     }
 
     // 处理 HTML 内容（使用 HTMLRewriter 重写资源链接）
     const contentType = response.headers.get("Content-Type") || "";
     if (contentType.includes("text/html")) {
       const htmlResponse = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
-      // 添加缓存和 CORS 头部
-      setNoCacheHeaders(htmlResponse.headers);
-      setCorsHeaders(htmlResponse.headers);
-      return htmlResponse;
+      return finalizeResponse(htmlResponse);
     }
 
-    // 非 HTML 内容：直接返回，但同样添加头部
+    // 非 HTML 内容
     const finalResponse = new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers
     });
-    setNoCacheHeaders(finalResponse.headers);
-    setCorsHeaders(finalResponse.headers);
-    return finalResponse;
+    return finalizeResponse(finalResponse);
 
   } catch (error) {
     return jsonResponse({ error: error.message }, 500);
   }
 }
 
+// ==================== 响应统一处理（移除 CSP 等）====================
+function finalizeResponse(response) {
+  const headers = response.headers;
+  // 移除可能导致资源加载失败的安全头
+  headers.delete('Content-Security-Policy');
+  headers.delete('X-Frame-Options');
+  headers.delete('X-Content-Type-Options');
+  // 添加缓存控制和 CORS
+  headers.set('Cache-Control', 'no-store');
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  headers.set('Access-Control-Allow-Headers', '*');
+  return response;
+}
+
 // ==================== 辅助函数 ====================
 
-// 补全协议
 function ensureProtocol(url, defaultProtocol) {
   if (url.startsWith("http://") || url.startsWith("https://")) {
     return url;
@@ -88,7 +89,6 @@ function ensureProtocol(url, defaultProtocol) {
   return defaultProtocol + "//" + url;
 }
 
-// 处理重定向（将 Location 转为代理路径）
 function handleRedirect(response) {
   const location = response.headers.get('location');
   if (!location) return response;
@@ -109,10 +109,9 @@ function handleRedirect(response) {
 
 // ==================== HTMLRewriter 处理器 ====================
 async function handleHtmlContent(response, protocol, host, actualUrlStr) {
-  const baseUrl = new URL(actualUrlStr).href; // 用于解析相对路径
+  const baseUrl = new URL(actualUrlStr).href;
 
   const rewriter = new HTMLRewriter()
-    // 处理 <a href>
     .on('a', {
       element(element) {
         const href = element.getAttribute('href');
@@ -124,7 +123,6 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
-    // 处理 <img src>
     .on('img', {
       element(element) {
         const src = element.getAttribute('src');
@@ -134,9 +132,20 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
             element.setAttribute('src', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
+        // 处理 srcset（响应式图片）
+        const srcset = element.getAttribute('srcset');
+        if (srcset) {
+          const newSrcset = srcset.split(',').map(part => {
+            const [url, size] = part.trim().split(/\s+/);
+            try {
+              const absolute = new URL(url, baseUrl).toString();
+              return `/${encodeURIComponent(absolute)}${size ? ' ' + size : ''}`;
+            } catch (_) { return part; }
+          }).join(', ');
+          element.setAttribute('srcset', newSrcset);
+        }
       }
     })
-    // 处理 <script src>
     .on('script', {
       element(element) {
         const src = element.getAttribute('src');
@@ -148,7 +157,6 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
-    // 处理 <link href> (CSS, favicon 等)
     .on('link', {
       element(element) {
         const href = element.getAttribute('href');
@@ -160,7 +168,6 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
-    // 处理 <style> 标签内的 CSS url()
     .on('style', {
       text(text) {
         const css = text.text;
@@ -175,7 +182,6 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         text.replace(newCss);
       }
     })
-    // 处理元素内联 style="background: url(...)"
     .on('*', {
       element(element) {
         const style = element.getAttribute('style');
@@ -193,14 +199,11 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
       }
     });
 
-  // 应用重写并返回新 Response
-  const modifiedResponse = rewriter.transform(response);
-  return modifiedResponse;
+  return rewriter.transform(response);
 }
 
-// ==================== 通用工具函数 ====================
+// ==================== 通用工具 ====================
 
-// JSON 响应
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data), {
     status: status,
@@ -208,24 +211,11 @@ function jsonResponse(data, status) {
   });
 }
 
-// 过滤请求头
 function filterHeaders(headers, filterFunc) {
   return new Headers([...headers].filter(([name]) => filterFunc(name)));
 }
 
-// 禁用缓存
-function setNoCacheHeaders(headers) {
-  headers.set('Cache-Control', 'no-store');
-}
-
-// CORS
-function setCorsHeaders(headers) {
-  headers.set('Access-Control-Allow-Origin', '*');
-  headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  headers.set('Access-Control-Allow-Headers', '*');
-}
-
-// ==================== 首页 HTML (保持不变) ====================
+// ==================== 首页 HTML（不变） ====================
 function getRootHtml() {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -246,10 +236,7 @@ function getRootHtml() {
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
   <style>
-      body, html {
-          height: 100%;
-          margin: 0;
-      }
+      body, html { height: 100%; margin: 0; }
       .background {
           background-size: cover;
           background-position: center;
@@ -266,21 +253,14 @@ function getRootHtml() {
           background-color: rgba(255, 255, 255, 1);
           box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.3);
       }
-      .input-field input[type=text] {
-          color: #2c3e50;
-      }
-      .input-field input[type=text]:focus+label {
-          color: #2c3e50 !important;
-      }
+      .input-field input[type=text] { color: #2c3e50; }
+      .input-field input[type=text]:focus+label { color: #2c3e50 !important; }
       .input-field input[type=text]:focus {
           border-bottom: 1px solid #2c3e50 !important;
           box-shadow: 0 1px 0 0 #2c3e50 !important;
       }
       @media (prefers-color-scheme: dark) {
-          body, html {
-              background-color: #121212;
-              color: #e0e0e0;
-          }
+          body, html { background-color: #121212; color: #e0e0e0; }
           .card {
               background-color: rgba(33, 33, 33, 0.9);
               color: #ffffff;
@@ -289,19 +269,13 @@ function getRootHtml() {
               background-color: rgba(50, 50, 50, 1);
               box-shadow: 0px 8px 16px rgba(0, 0, 0, 0.6);
           }
-          .input-field input[type=text] {
-              color: #ffffff;
-          }
-          .input-field input[type=text]:focus+label {
-              color: #ffffff !important;
-          }
+          .input-field input[type=text] { color: #ffffff; }
+          .input-field input[type=text]:focus+label { color: #ffffff !important; }
           .input-field input[type=text]:focus {
               border-bottom: 1px solid #ffffff !important;
               box-shadow: 0 1px 0 0 #ffffff !important;
           }
-          label {
-              color: #cccccc;
-          }
+          label { color: #cccccc; }
       }
   </style>
 </head>
