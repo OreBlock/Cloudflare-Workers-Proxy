@@ -1,12 +1,9 @@
-// _worker.js - 带前端拦截脚本，解决 API 跨域问题
+// _worker.js - 最终版：删除响应头 CSP 和 HTML meta CSP
 export default {
   async fetch(request) {
     return handleRequest(request);
   }
 };
-
-const DEFAULT_ORIGIN = 'https://www.luogu.com.cn';
-const PROXY_DOMAIN = '你的代理域名'; // ⚠️ 请替换为你的实际代理域名（如 cloudflare-workers-proxy-doi.pages.dev）
 
 async function handleRequest(request) {
   try {
@@ -18,35 +15,17 @@ async function handleRequest(request) {
       }));
     }
 
-    let rawPath = decodeURIComponent(url.pathname.substring(1));
-    let actualUrlStr = rawPath;
-
-    if (!actualUrlStr.startsWith("http://") && !actualUrlStr.startsWith("https://")) {
-      let baseOrigin = null;
-      const referer = request.headers.get('Referer');
-      if (referer) {
-        try {
-          const refererUrl = new URL(referer);
-          const path = refererUrl.pathname;
-          if (path.startsWith('/')) {
-            const decoded = decodeURIComponent(path.substring(1));
-            if (decoded.startsWith("http://") || decoded.startsWith("https://")) {
-              baseOrigin = new URL(decoded).origin;
-            }
-          }
-        } catch (e) {}
-      }
-      if (!baseOrigin) baseOrigin = DEFAULT_ORIGIN;
-      actualUrlStr = baseOrigin + (actualUrlStr.startsWith('/') ? '' : '/') + actualUrlStr;
-    }
-    if (url.search) actualUrlStr += url.search;
+    let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
+    actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
+    actualUrlStr += url.search;
 
     const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
-    try {
-      const targetOrigin = new URL(actualUrlStr).origin;
-      newHeaders.set('Referer', targetOrigin);
-      newHeaders.set('Origin', targetOrigin);
-    } catch (e) {}
+    if (newHeaders.has('Referer')) {
+      try {
+        const targetOrigin = new URL(actualUrlStr).origin;
+        newHeaders.set('Referer', targetOrigin);
+      } catch (e) {}
+    }
 
     const modifiedRequest = new Request(actualUrlStr, {
       headers: newHeaders,
@@ -66,29 +45,29 @@ async function handleRequest(request) {
       const htmlResponse = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
       return finalizeResponse(htmlResponse);
     }
-    if (contentType.includes("text/css")) {
-      const cssResponse = await handleCssContent(response, actualUrlStr);
-      return finalizeResponse(cssResponse);
-    }
 
     return finalizeResponse(response);
 
   } catch (error) {
-    console.error(error);
     return jsonResponse({ error: error.message }, 500);
   }
 }
 
-// ========== 响应头处理 ==========
+// ========== 响应头处理：保留所有头，只删除危险头 ==========
 function finalizeResponse(response) {
   const newHeaders = new Headers(response.headers);
+  
   newHeaders.delete('Content-Security-Policy');
   newHeaders.delete('X-Frame-Options');
   newHeaders.delete('X-Content-Type-Options');
+  // 也可能有其他类似头，可酌情删除
+  // newHeaders.delete('Referrer-Policy');
+  
   newHeaders.set('Cache-Control', 'no-store');
   newHeaders.set('Access-Control-Allow-Origin', '*');
   newHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   newHeaders.set('Access-Control-Allow-Headers', '*');
+
   return new Response(response.body, {
     status: response.status,
     statusText: response.statusText,
@@ -96,7 +75,14 @@ function finalizeResponse(response) {
   });
 }
 
-// ========== 重定向 ==========
+// ========== 辅助函数 ==========
+function ensureProtocol(url, defaultProtocol) {
+  if (url.startsWith("http://") || url.startsWith("https://")) {
+    return url;
+  }
+  return defaultProtocol + "//" + url;
+}
+
 function handleRedirect(response) {
   const location = response.headers.get('location');
   if (!location) return response;
@@ -115,96 +101,12 @@ function handleRedirect(response) {
   }
 }
 
-// ========== CSS 重写 ==========
-async function handleCssContent(response, cssUrl) {
-  const baseUrl = cssUrl;
-  const originalText = await response.text();
-  let newText = originalText.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, path, q2) => {
-    try {
-      if (path.startsWith('http://') || path.startsWith('https://') || path.startsWith('data:')) return match;
-      const absolute = new URL(path, baseUrl).href;
-      const proxied = `/${encodeURIComponent(absolute)}`;
-      return `url(${q1}${proxied}${q2})`;
-    } catch (e) {
-      try {
-        const absolute = new URL(path, DEFAULT_ORIGIN).href;
-        const proxied = `/${encodeURIComponent(absolute)}`;
-        return `url(${q1}${proxied}${q2})`;
-      } catch (_) { return match; }
-    }
-  });
-  newText = newText.replace(/@import\s+['"]([^'"]+)['"]/g, (match, path) => {
-    try {
-      if (path.startsWith('http://') || path.startsWith('https://')) return match;
-      const absolute = new URL(path, baseUrl).href;
-      const proxied = `/${encodeURIComponent(absolute)}`;
-      return `@import "${proxied}"`;
-    } catch (e) { return match; }
-  });
-  return new Response(newText, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers
-  });
-}
-
-// ========== HTML 重写（注入拦截脚本） ==========
+// ========== HTMLRewriter 处理器（含 meta CSP 删除） ==========
 async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   const baseUrl = new URL(actualUrlStr).href;
 
-  // ---- 注入的拦截脚本 ----
-  const injectScript = `
-  <script>
-  (function() {
-    // 需要代理的域名列表（根据实际情况调整）
-    const targetDomains = ['luogu.com.cn', 'cdn.luogu.com.cn', 'fecdn.luogu.com.cn', 'www.luogu.com.cn'];
-    const proxyOrigin = window.location.origin; // 即你的代理域名
-
-    function proxyUrl(url) {
-      try {
-        const u = new URL(url);
-        if (targetDomains.some(d => u.hostname.endsWith(d))) {
-          // 将原站绝对 URL 转为代理路径
-          return proxyOrigin + '/' + encodeURIComponent(u.toString());
-        }
-        return url;
-      } catch (e) {
-        return url;
-      }
-    }
-
-    // 拦截 fetch
-    const originalFetch = window.fetch;
-    window.fetch = function(input, init) {
-      let url = typeof input === 'string' ? input : input.url;
-      if (url) {
-        const proxied = proxyUrl(url);
-        if (proxied !== url) {
-          return originalFetch(proxied, init);
-        }
-      }
-      return originalFetch(input, init);
-    };
-
-    // 拦截 XMLHttpRequest
-    const OriginalXHR = window.XMLHttpRequest;
-    window.XMLHttpRequest = function() {
-      const xhr = new OriginalXHR();
-      const originalOpen = xhr.open;
-      xhr.open = function(method, url, async, user, password) {
-        const proxied = proxyUrl(url);
-        if (proxied !== url) {
-          return originalOpen.call(this, method, proxied, async !== false, user, password);
-        }
-        return originalOpen.call(this, method, url, async !== false, user, password);
-      };
-      return xhr;
-    };
-  })();
-  </script>
-  `;
-
   const rewriter = new HTMLRewriter()
+    // === 删除 CSP meta 标签 ===
     .on('meta', {
       element(element) {
         const httpEquiv = element.getAttribute('http-equiv');
@@ -213,18 +115,13 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         }
       }
     })
-    // 在 <head> 末尾注入脚本
-    .on('head', {
-      element(element) {
-        element.append(injectScript, { html: true });
-      }
-    })
+    // 处理链接
     .on('a', {
       element(element) {
         const href = element.getAttribute('href');
         if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
           try {
-            const absolute = new URL(href, baseUrl).href;
+            const absolute = new URL(href, baseUrl).toString();
             element.setAttribute('href', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
@@ -235,7 +132,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         const src = element.getAttribute('src');
         if (src) {
           try {
-            const absolute = new URL(src, baseUrl).href;
+            const absolute = new URL(src, baseUrl).toString();
             element.setAttribute('src', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
@@ -244,7 +141,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
           const newSrcset = srcset.split(',').map(part => {
             const [url, size] = part.trim().split(/\s+/);
             try {
-              const absolute = new URL(url, baseUrl).href;
+              const absolute = new URL(url, baseUrl).toString();
               return `/${encodeURIComponent(absolute)}${size ? ' ' + size : ''}`;
             } catch (_) { return part; }
           }).join(', ');
@@ -257,7 +154,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         const src = element.getAttribute('src');
         if (src) {
           try {
-            const absolute = new URL(src, baseUrl).href;
+            const absolute = new URL(src, baseUrl).toString();
             element.setAttribute('src', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
@@ -268,7 +165,7 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
         const href = element.getAttribute('href');
         if (href) {
           try {
-            const absolute = new URL(href, baseUrl).href;
+            const absolute = new URL(href, baseUrl).toString();
             element.setAttribute('href', `/${encodeURIComponent(absolute)}`);
           } catch (_) {}
         }
@@ -277,9 +174,9 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
     .on('style', {
       text(text) {
         const css = text.text;
-        const newCss = css.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, path, q2) => {
+        const newCss = css.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, url, q2) => {
           try {
-            const absolute = new URL(path, baseUrl).href;
+            const absolute = new URL(url, baseUrl).toString();
             return `url(${q1}/${encodeURIComponent(absolute)}${q2})`;
           } catch (_) {
             return match;
@@ -292,9 +189,9 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
       element(element) {
         const style = element.getAttribute('style');
         if (style) {
-          const newStyle = style.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, path, q2) => {
+          const newStyle = style.replace(/url\((['"]?)([^'"()]+)(['"]?)\)/g, (match, q1, url, q2) => {
             try {
-              const absolute = new URL(path, baseUrl).href;
+              const absolute = new URL(url, baseUrl).toString();
               return `url(${q1}/${encodeURIComponent(absolute)}${q2})`;
             } catch (_) {
               return match;
@@ -308,7 +205,6 @@ async function handleHtmlContent(response, protocol, host, actualUrlStr) {
   return rewriter.transform(response);
 }
 
-// ========== 工具 ==========
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data), {
     status: status,
